@@ -1,0 +1,152 @@
+import os
+import torch
+import torch.nn as nn
+import torchaudio
+from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import train_test_split
+from tqdm import tqdm
+from model import Config, VoiceCommandModel
+
+
+class VoiceDataset(Dataset):
+    """带数据验证的数据集类"""
+
+    def __init__(self, files, config):
+        self.files = files
+        self.config = config
+        self.label_map = {label: i for i, label in enumerate(config.commands)}
+
+        # 数据校验
+        assert len(files) > 0, "未找到任何音频文件"
+        self._validate_audio_files()
+
+    def _validate_audio_files(self):
+        """验证所有音频文件可加载"""
+        for path, _ in self.files:
+            try:
+                wav, sr = torchaudio.load(path)
+                assert sr == self.config.sample_rate, f"采样率不匹配: {path}"
+                assert wav.shape[0] == 1, f"非单声道音频: {path}"
+            except Exception as e:
+                raise RuntimeError(f"无效音频文件 {path}: {str(e)}")
+
+    def __getitem__(self, idx):
+        path, label = self.files[idx]
+        waveform, _ = torchaudio.load(path)
+        waveform = waveform[0]  # 单声道
+
+        # 标准化长度
+        target_len = int(self.config.max_length * self.config.sample_rate)
+        waveform = torch.nn.functional.pad(
+            waveform[:target_len],
+            (0, max(0, target_len - len(waveform)))
+        )
+
+        # 提取特征
+        mel = torchaudio.transforms.MelSpectrogram(
+            sample_rate=self.config.sample_rate,
+            n_fft=self.config.n_fft,
+            hop_length=self.config.hop_length,
+            n_mels=self.config.n_mels
+        )(waveform)
+        log_mel = torch.log(mel.clamp(min=1e-9))
+
+        # 固定时间维度
+        if log_mel.shape[1] < self.config.max_time_steps:
+            log_mel = torch.nn.functional.pad(
+                log_mel,
+                (0, self.config.max_time_steps - log_mel.shape[1])
+            )
+        else:
+            log_mel = log_mel[:, :self.config.max_time_steps]
+
+        return log_mel, self.label_map[label]
+
+    def __len__(self):
+        return len(self.files)
+
+
+def train():
+    """训练流程（含完整异常处理）"""
+    try:
+        config = Config()#配置初始化
+        print(f"配置参数验证:\n"
+              f"- 数据集路径: {config.data_dir}\n"
+              f"- 特征维度: {config.n_mels} Mel频带 x {config.max_time_steps} 时间步")
+
+        # 准备数据
+        file_list = []
+        for label in config.commands:
+            label_dir = os.path.join(config.data_dir, label)
+            files = [(os.path.join(label_dir, f), label)
+                     for f in os.listdir(label_dir) if f.endswith('.wav')]
+            assert len(files) > 0, f"{label}类别无有效数据"
+            file_list.extend(files)
+
+        train_files, val_files = train_test_split(
+            file_list, test_size=0.2, stratify=[f[1] for f in file_list]
+        )
+
+        # 数据加载器
+        train_loader = DataLoader(
+            VoiceDataset(train_files, config),
+            batch_size=config.batch_size,
+            shuffle=True,
+            num_workers=0,  # 避免多进程问题
+            drop_last=True
+        )
+        val_loader = DataLoader(
+            VoiceDataset(val_files, config),
+            batch_size=config.batch_size
+        )
+
+        # 初始化模型
+        model = VoiceCommandModel(config).to(config.device)
+        optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
+        criterion = nn.CrossEntropyLoss()
+
+        # 训练循环
+        best_acc = 0.0
+        for epoch in range(config.epochs):
+            model.train()
+            progress = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{config.epochs}")
+            for inputs, labels in progress:
+                inputs, labels = inputs.to(config.device), labels.to(config.device)
+
+                optimizer.zero_grad()
+                outputs = model(inputs)
+                loss = criterion(outputs, labels)
+                loss.backward()
+                optimizer.step()
+
+                progress.set_postfix(loss=f"{loss.item():.4f}")
+
+            # 验证
+            val_acc = evaluate(model, val_loader, config)
+            if val_acc > best_acc:
+                best_acc = val_acc
+                torch.save(model.state_dict(), "best_model.pth")
+                print(f"保存最佳模型，准确率: {val_acc:.2%}")
+
+    except Exception as e:
+        print(f"训练失败: {str(e)}")
+        raise
+
+
+def evaluate(model, loader, config):
+    """带验证的评估函数"""
+    model.eval()
+    correct = 0
+    with torch.no_grad():
+        for inputs, labels in loader:
+            inputs, labels = inputs.to(config.device), labels.to(config.device)
+            outputs = model(inputs)
+            correct += (outputs.argmax(1) == labels).sum().item()
+
+    acc = correct / len(loader.dataset)
+    assert 0 <= acc <= 1, f"异常准确率: {acc}"
+    return acc
+
+
+if __name__ == "__main__":
+    train()
