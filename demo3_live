@@ -1,0 +1,204 @@
+import torch
+import numpy as np
+import pyaudio
+import serial
+import time
+import argparse
+from collections import deque
+import torchaudio
+from scipy.signal import butter, lfilter
+from model import Config, VoiceCommandModel
+
+
+class VoiceController:
+    def __init__(self, model_path, port='COM4'):
+        # 初始化配置参数
+        self.SILENCE_THRESHOLD = 500  # 音量触发阈值（原300）
+        self.MIN_VOICE_LENGTH = 1.0  # 有效指令最短时长（秒）
+        self.MIN_CONFIDENCE = 0.7  # 最低执行置信度
+        self.CMD_COOLDOWN = 1.0  # 指令冷却时间（秒）
+
+        # 设备配置
+        self.config = Config()
+        self.config.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"使用设备: {self.config.device}")
+
+        # 加载模型
+        self.model = self._load_model(model_path)
+
+        # 音频缓冲区（5秒容量）
+        self.audio_buffer = deque(maxlen=int(16000 / 1024 * 5))
+
+        # 指令映射（必须包含\n）
+        self.command_map = {
+            'forward': b'F\n',
+            'back': b'B\n',
+            'left': b'L\n',
+            'right': b'R\n',
+            'stop': b'S\n'
+        }
+
+        # 状态记录
+        self.last_cmd_time = 0
+
+        # 初始化硬件
+        self.ser = self._init_serial(port)
+        self.setup_audio()
+
+    def _load_model(self, path):
+        model = VoiceCommandModel(self.config).eval()
+        model.load_state_dict(
+            torch.load(path, map_location=self.config.device, weights_only=True)
+        )
+        print("模型加载成功，输入特征维度:", model.conv(torch.randn(1, 1, 64, 125)).shape)
+        return model.to(self.config.device)
+
+    def _init_serial(self, port):
+        try:
+            ser = serial.Serial(port, 9600, dsrdtr=False, timeout=1)
+            time.sleep(2)  # 等待Arduino初始化
+            ser.reset_input_buffer()
+            print(f"已连接Arduino: {ser.name}")
+            return ser
+        except Exception as e:
+            print(f"串口连接失败: {str(e)}")
+            exit(1)
+
+    def setup_audio(self):
+        self.audio = pyaudio.PyAudio()
+
+        # 打印可用麦克风
+        print("\n可用音频输入设备:")
+        for i in range(self.audio.get_device_count()):
+            info = self.audio.get_device_info_by_index(i)
+            if info["maxInputChannels"] > 0:
+                print(f"[{i}] {info['name']}")
+
+        # 手动选择麦克风（根据实际修改）
+        self.mic_index = 1
+
+        self.stream = self.audio.open(
+            format=pyaudio.paInt16,
+            channels=1,
+            rate=16000,
+            input=True,
+            frames_per_buffer=1024,
+            stream_callback=self.audio_callback,
+            input_device_index=self.mic_index
+        )
+
+    def butter_highpass(self, cutoff=100, fs=16000, order=4):
+        nyq = 0.5 * fs
+        normal_cutoff = cutoff / nyq
+        b, a = butter(order, normal_cutoff, btype='high', analog=False)
+        return b, a
+
+    def audio_callback(self, in_data, frame_count, time_info, status):
+        try:
+            current_time = time.time()
+            if current_time - self.last_cmd_time < self.CMD_COOLDOWN:
+                return (in_data, pyaudio.paContinue)
+
+            audio = np.frombuffer(in_data, dtype=np.int16)
+            if len(audio) == 0:
+                return (in_data, pyaudio.paContinue)
+
+            # 实时音量显示
+            rms = np.sqrt(np.mean(np.square(audio.astype(np.float32))))
+            print(f"\r当前音量: {rms:6.1f} (阈值: {self.SILENCE_THRESHOLD})", end="", flush=True)
+
+            # 触发条件
+            if (not np.isnan(rms)
+                    and rms > self.SILENCE_THRESHOLD
+                    and len(self.audio_buffer) >= int(self.MIN_VOICE_LENGTH * 16000 / 1024)):
+                self.process_command()
+                self.last_cmd_time = time.time()
+
+            self.audio_buffer.append(audio)
+        except Exception as e:
+            print(f"\n音频回调异常: {str(e)}")
+        return (in_data, pyaudio.paContinue)
+
+    def process_command(self):
+        try:
+            # 高通滤波
+            b, a = self.butter_highpass()
+            filtered_audio = lfilter(b, a, np.concatenate(self.audio_buffer))
+
+            # 长度校验
+            if len(filtered_audio) < 16000 * self.MIN_VOICE_LENGTH:
+                print("\n音频过短，已忽略")
+                return
+
+            # 预处理
+            inputs = self.preprocess(filtered_audio)
+
+            # 模型推理
+            with torch.no_grad():
+                logits = self.model(inputs)
+                probs = torch.softmax(logits, dim=1)
+                confidence, pred = torch.max(probs, dim=1)
+
+            # 置信度过滤
+            command = self.config.commands[pred.item()]
+            if confidence.item() < self.MIN_CONFIDENCE:
+                print(f"\n拒绝低置信指令: {command} ({confidence.item():.2f})")
+                return
+
+            # 执行指令
+            print(f"\n执行指令: {command} (置信度: {confidence.item():.2f})")
+            self.ser.write(self.command_map[command])
+
+            # 读取响应
+            response = self.ser.readline().decode().strip()
+            if response:
+                print(f"Arduino响应: {response}")
+
+        except Exception as e:
+            print(f"\n指令处理异常: {str(e)}")
+        finally:
+            self.audio_buffer.clear()
+
+    def preprocess(self, audio):
+        waveform = torch.from_numpy(audio.astype(np.float32))
+        if waveform.abs().max() > 0:
+            waveform /= waveform.abs().max()
+
+        target_len = int(self.config.max_length * 16000)
+        if len(waveform) < target_len:
+            waveform = torch.nn.functional.pad(waveform, (0, target_len - len(waveform)))
+        else:
+            waveform = waveform[:target_len]
+
+        mel = torchaudio.transforms.MelSpectrogram(
+            sample_rate=16000,
+            n_fft=self.config.n_fft,
+            hop_length=self.config.hop_length,
+            n_mels=self.config.n_mels
+        )(waveform)
+
+        return torch.log(mel + 1e-9).unsqueeze(0).to(self.config.device)
+
+    def run(self):
+        try:
+            print("\n监听中... (Ctrl+C退出)")
+            while True:
+                time.sleep(0.1)
+        except KeyboardInterrupt:
+            self.close()
+
+    def close(self):
+        print("\n释放资源...")
+        self.stream.stop_stream()
+        self.stream.close()
+        self.audio.terminate()
+        self.ser.close()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--port", default="COM4", help="Arduino串口")
+    args = parser.parse_args()
+
+    controller = VoiceController("best_model.pth", args.port)
+    controller.run()
