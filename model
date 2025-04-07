@@ -1,0 +1,94 @@
+import os
+import torch
+import torch.nn as nn
+
+
+class Config:
+    """鲁棒配置类，解决所有初始化顺序问题"""
+    _defaults = {
+        'commands': ['forward', 'back', 'left', 'right', 'stop'],
+        'sample_rate': 16000,
+        'max_length': 2.0,  # 秒
+        'n_fft': 512,
+        'hop_length': 256,
+        'n_mels': 64,
+        'batch_size': 32,
+        'epochs': 50,
+        'lr': 0.001
+    }
+
+    def __init__(self, **kwargs):
+        # 初始化默认参数
+        self.__dict__.update(self._defaults)
+        # 更新用户自定义参数
+        self.__dict__.update(kwargs)
+        # 设备自动检测
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # 自检参数有效性
+        self._validate()
+
+    def _validate(self):
+        """参数有效性检查"""
+        assert self.hop_length > 0, "hop_length必须大于0"
+        assert self.n_fft > self.hop_length, "n_fft必须大于hop_length"
+        assert os.path.exists(self.data_dir), f"数据集路径不存在: {self.data_dir}"
+
+    @property
+    def data_dir(self):
+        """动态计算数据集路径"""
+        return os.path.join(os.path.dirname(os.path.dirname(__file__)), "dataset")
+
+    @property
+    def max_time_steps(self):
+        """计算最大时间步长"""
+        return int(self.max_length * self.sample_rate / self.hop_length) + 1
+
+    @property
+    def num_classes(self):
+        return len(self.commands)
+
+
+class VoiceCommandModel(nn.Module):
+    """带自检机制的模型类"""
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+
+        # 卷积层
+        self.conv = nn.Sequential(
+            nn.Conv2d(1, 32, 3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, 3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Conv2d(64, 128, 3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            nn.MaxPool2d(2)
+        )
+
+        # 自检计算全连接层输入尺寸
+        fc_input = self._calculate_fc_size()
+        print(f"全连接层输入维度: {fc_input}")  # 调试输出
+
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(fc_input, 256),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(256, config.num_classes)
+        )
+
+    def _calculate_fc_size(self):
+        dummy = torch.zeros(1, 1, self.config.n_mels, self.config.max_time_steps)
+        return self.conv(dummy).view(1, -1).shape[1]
+
+    def forward(self, x):
+        # 输入维度检查
+        assert x.ndim == 3, f"输入应为3D张量，实际得到{x.ndim}D"
+        return self.classifier(self.conv(x.unsqueeze(1)))
